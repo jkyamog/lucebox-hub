@@ -779,7 +779,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
               verify_mode: str = "ddtree",
               extra_daemon_args: list[str] | None = None,
               lazy_draft: bool = False,
-              verbose_daemon: bool = False) -> FastAPI:
+              verbose_daemon: bool = False,
+              force_no_thinking: bool = False) -> FastAPI:
     import asyncio
     if _extra_daemon_has_target_sharding(extra_daemon_args):
         if prefix_cache_slots > 0 or prefill_cache_slots > 0:
@@ -999,6 +1000,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         tpl_kwargs.update(
             {k: v for k, v in (template_kwargs or {}).items() if k in _ALLOWED_TEMPLATE_KWARGS}
         )
+        # Server-level override: prevent any per-request opt-in.
+        if force_no_thinking:
+            tpl_kwargs["enable_thinking"] = False
         if tools_arg:
             tpl_kwargs["tools"] = tools_arg
         prompt = tokenizer.apply_chat_template(msgs_list, **tpl_kwargs)
@@ -2782,6 +2786,10 @@ def main():
                     help="Pass --draft-feature-mirror to test_dflash (safe cross-GPU feature path)")
     ap.add_argument("--peer-access", action="store_true",
                     help="Pass --peer-access to test_dflash (prefer P2P memcpy when available)")
+    ap.add_argument("--no-thinking", action="store_true",
+                    help="Server-level guard: prevent any request from enabling thinking mode "
+                         "via chat_template_kwargs. Useful on hardware (e.g. gfx1151/Strix Halo) "
+                         "where thinking chains consume n_gen budget without benefit.")
     add_cli_flags(ap)
     args = ap.parse_args()
     prefill_cfg = config_from_args(args)
@@ -2858,7 +2866,8 @@ def main():
                     verify_mode=args.verify_mode,
                     extra_daemon_args=placement.daemon_args or None,
                     lazy_draft=args.lazy_draft,
-                    verbose_daemon=args.verbose_daemon)
+                    verbose_daemon=args.verbose_daemon,
+                    force_no_thinking=args.no_thinking)
 
     import uvicorn
     logging.basicConfig(
