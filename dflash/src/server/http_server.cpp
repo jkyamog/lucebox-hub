@@ -416,36 +416,46 @@ void HttpServer::worker_loop() {
             }
 
             if (should_compress) {
-                // 1. Decode prompt to text using target tokenizer
-                std::string prompt_text = tokenizer_.decode(req.prompt_tokens);
+                // Check full-compress cache FIRST — if we've seen this exact
+                // raw prompt before, skip the expensive compress cycle entirely.
+                auto [full_slot, full_len] = prefix_cache_.lookup_full(req.prompt_tokens);
+                if (full_slot >= 0) {
+                    std::fprintf(stderr, "[pflash] full-cache hit slot=%d — skipping compress\n", full_slot);
+                    pflash_compressed = true;
+                    // effective_prompt stays as req.prompt_tokens — the cached KV
+                    // state will be restored via cache_slot below.
+                } else {
+                    // 1. Decode prompt to text using target tokenizer
+                    std::string prompt_text = tokenizer_.decode(req.prompt_tokens);
 
-                // 2. Re-encode with drafter tokenizer
-                auto drafter_ids = drafter_tokenizer_->encode(prompt_text);
+                    // 2. Re-encode with drafter tokenizer
+                    auto drafter_ids = drafter_tokenizer_->encode(prompt_text);
 
-                if (!drafter_ids.empty()) {
-                    // 3. Compress via typed API
-                    ModelBackend::CompressRequest creq;
-                    creq.input_ids = std::move(drafter_ids);
-                    creq.keep_ratio = config_.pflash_keep_ratio;
-                    creq.drafter_path = config_.pflash_drafter_path;
-                    creq.skip_park = config_.pflash_skip_park;
+                    if (!drafter_ids.empty()) {
+                        // 3. Compress via typed API
+                        ModelBackend::CompressRequest creq;
+                        creq.input_ids = std::move(drafter_ids);
+                        creq.keep_ratio = config_.pflash_keep_ratio;
+                        creq.drafter_path = config_.pflash_drafter_path;
+                        creq.skip_park = config_.pflash_skip_park;
 
-                    auto cresult = backend_.compress(creq);
+                        auto cresult = backend_.compress(creq);
 
-                    // 4. Decode compressed IDs with drafter tokenizer
-                    if (cresult.ok && !cresult.compressed_ids.empty()) {
-                        std::string compressed_text =
-                            drafter_tokenizer_->decode(cresult.compressed_ids);
+                        // 4. Decode compressed IDs with drafter tokenizer
+                        if (cresult.ok && !cresult.compressed_ids.empty()) {
+                            std::string compressed_text =
+                                drafter_tokenizer_->decode(cresult.compressed_ids);
 
-                        // 5. Re-tokenize with target tokenizer
-                        effective_prompt = tokenizer_.encode(compressed_text);
-                        pflash_compressed = true;
+                            // 5. Re-tokenize with target tokenizer
+                            effective_prompt = tokenizer_.encode(compressed_text);
+                            pflash_compressed = true;
 
-                        std::fprintf(stderr,
-                            "[pflash] %d -> %d -> %d tokens (%.1f%% kept)\n",
-                            n_prompt, (int)cresult.compressed_ids.size(),
-                            (int)effective_prompt.size(),
-                            100.0 * effective_prompt.size() / n_prompt);
+                            std::fprintf(stderr,
+                                "[pflash] %d -> %d -> %d tokens (%.1f%% kept)\n",
+                                n_prompt, (int)cresult.compressed_ids.size(),
+                                (int)effective_prompt.size(),
+                                100.0 * effective_prompt.size() / n_prompt);
+                        }
                     }
                 }
             }

@@ -93,13 +93,6 @@ static bool is_letter(uint32_t cp) {
     if (cp >= 0x1100 && cp <= 0x11FF) return true;  // Hangul Jamo
     if (cp >= 0x2E80 && cp <= 0x2EFF) return true;  // CJK Radicals
     if (cp >= 0x3000 && cp <= 0x303F) return true;  // CJK Symbols
-    // Catch-all: treat non-ASCII, non-digit, non-whitespace, non-punct as letter
-    // if it's in certain high ranges. This is approximate but sufficient.
-    if (cp >= 0x1000 && cp <= 0xFFFD &&
-        !is_letter(cp)) {
-        // Avoid infinite recursion — this branch only catches remaining ranges
-        return false;
-    }
     return false;
 }
 
