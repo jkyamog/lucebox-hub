@@ -1237,6 +1237,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     def _max_tokens_for(req) -> int:
         return getattr(req, "max_completion_tokens", None) or req.max_tokens
 
+    def _retain_stream_prompt_file(path: Path | None) -> None:
+        if path is not None:
+            log.debug("retaining stream prompt .bin: %s", path)
+
     # ── /v1/chat/completions ────────────────────────────────────────────────
 
     @app.post("/v1/chat/completions")
@@ -1446,9 +1450,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                 completion_tokens, full_snap_prep_ref[0], snap_prep,
                                 prompt_ids, cur_bin, cur_ids, inline_snap_ok)
                             yield "data: [DONE]\n\n"
-                            if timing.get("daemon_done") and full_hit is None:
-                                try: cur_bin.unlink()
-                                except Exception: pass
+                            _retain_stream_prompt_file(
+                                cur_bin if full_hit is None else prompt_bin)
                             _park_draft_if_lazy(timing)
                             return
 
@@ -1483,14 +1486,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                 out = emit_delta(tool_buffer, "content")
                                 if out: yield out
                     finally:
-                        if timing.get("daemon_done"):
-                            if full_hit is None:
-                                try: cur_bin.unlink()
-                                except Exception: pass
-                            else:
-                                try: prompt_bin.unlink()
-                                except Exception: pass
-                        else:
+                        _retain_stream_prompt_file(
+                            cur_bin if full_hit is None else prompt_bin)
+                        if not timing.get("daemon_done"):
                             log.warning(
                                 "stream ended before daemon sentinel; "
                                 "retaining prompt .bin for in-flight daemon read")
@@ -1810,14 +1808,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             out_tokens += 1
                             tokens.append(tok_id)
                     finally:
-                        if timing.get("daemon_done"):
-                            if full_hit is None:
-                                try: cur_bin.unlink()
-                                except Exception: pass
-                            else:
-                                try: prompt_bin.unlink()
-                                except Exception: pass
-                        else:
+                        _retain_stream_prompt_file(
+                            cur_bin if full_hit is None else prompt_bin)
+                        if not timing.get("daemon_done"):
                             log.warning(
                                 "stream ended before daemon sentinel; "
                                 "retaining prompt .bin for in-flight daemon read")
@@ -2450,14 +2443,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     window = ""
 
                 finally:
-                    if timing.get("daemon_done"):
-                        if full_hit is None:
-                            try: cur_bin.unlink()
-                            except Exception: pass
-                        else:
-                            try: prompt_bin.unlink()
-                            except Exception: pass
-                    else:
+                    _retain_stream_prompt_file(
+                        cur_bin if full_hit is None else prompt_bin)
+                    if not timing.get("daemon_done"):
                         log.warning(
                             "stream ended before daemon sentinel; "
                             "retaining prompt .bin for in-flight daemon read")
