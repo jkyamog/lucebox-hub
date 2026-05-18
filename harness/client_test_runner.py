@@ -1520,61 +1520,102 @@ def _run_bench_case(
     case: dict[str, Any],
     *,
     max_tokens_override: int | None = None,
-    stream: bool = False,
 ) -> dict[str, Any]:
-    """Run a single bench case against the server. Returns result dict."""
+    """Run a single bench case via streaming to capture TTFT and detailed metrics.
+
+    Always uses streaming to get: walltime, TTFT, prompt_tokens, completion_tokens,
+    prefill tok/s, and decode tok/s (excluding prefill).
+    """
     messages = case["messages"]
     max_tokens = max_tokens_override or case.get("max_tokens", 256)
 
-    if stream:
-        # Use streaming to measure TTFT
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        result = http_sse(
-            base_url + "/v1/chat/completions",
-            payload,
-            timeout=600,
-        )
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        base_url + "/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+    )
+
+    t0 = time.perf_counter()
+    first_token_time = None
+    token_deltas = 0
+    text = ""
+    usage: dict[str, Any] = {}
+    status = 0
+
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            status = resp.status
+            for raw in resp:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                # Capture usage from the final chunk
+                if obj.get("usage"):
+                    usage = obj["usage"]
+                choices = obj.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    piece = (
+                        delta.get("content")
+                        or delta.get("reasoning_content")
+                        or ""
+                    )
+                    if piece:
+                        if first_token_time is None:
+                            first_token_time = time.perf_counter()
+                        token_deltas += 1
+                        text += str(piece)
+    except urllib.error.HTTPError as exc:
         return {
             "id": case["id"],
-            "ok": result.get("ok", False),
-            "text": result.get("generated_text_tail", ""),
-            "token_deltas": result.get("token_deltas", 0),
-            "seconds": result.get("seconds", 0.0),
-            "first_token_seconds": result.get("first_token_seconds"),
-            "stream": True,
+            "ok": False,
+            "status": exc.code,
+            "error": exc.read().decode("utf-8", errors="replace")[-2000:],
         }
-    else:
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-        }
-        t0 = time.perf_counter()
-        status, body, elapsed = http_json("POST", base_url + "/v1/chat/completions", payload, timeout=600)
-        text = openai_chat_text(body)
-        usage = body.get("usage") if isinstance(body, dict) else None
-        completion_tokens = (usage or {}).get("completion_tokens", 0)
-        prompt_tokens = (usage or {}).get("prompt_tokens", 0)
-        tok_s = completion_tokens / elapsed if elapsed > 0 and completion_tokens > 0 else 0.0
+    except (urllib.error.URLError, TimeoutError, ConnectionResetError) as exc:
         return {
             "id": case["id"],
-            "ok": status == 200 and bool(text.strip()),
-            "status": status,
-            "text": text,
-            "completion_tokens": completion_tokens,
-            "prompt_tokens": prompt_tokens,
-            "seconds": round(elapsed, 3),
-            "tok_s": round(tok_s, 2),
-            "stream": False,
+            "ok": False,
+            "error": repr(exc),
         }
+
+    wall_s = time.perf_counter() - t0
+    ttft_s = (first_token_time - t0) if first_token_time else None
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens") or token_deltas
+
+    # Compute derived metrics
+    prefill_tok_s = prompt_tokens / ttft_s if (ttft_s and ttft_s > 0 and prompt_tokens > 0) else None
+    decode_s = (wall_s - ttft_s) if ttft_s else None
+    output_tok_s = completion_tokens / decode_s if (decode_s and decode_s > 0 and completion_tokens > 0) else None
+
+    return {
+        "id": case["id"],
+        "ok": status == 200 and bool(text.strip()),
+        "text": text,
+        "wall_s": round(wall_s, 3),
+        "ttft_s": round(ttft_s, 4) if ttft_s else None,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "prefill_tok_s": round(prefill_tok_s, 1) if prefill_tok_s else None,
+        "output_tok_s": round(output_tok_s, 2) if output_tok_s else None,
+    }
 
 
 def _run_bench_suite(
@@ -1589,20 +1630,21 @@ def _run_bench_suite(
     if n_sample is not None and n_sample < len(cases):
         cases = cases[:n_sample]
 
-    use_stream = (suite == "agent")
     results = []
     n_correct, n_scored = 0, 0
 
     print(f"\n[bench] === {suite.upper()} (n={len(cases)}) ===", flush=True)
+    print(f"  {'#':>3s}  {'id':<16s}  {'wall':>6s}  {'TTFT':>7s}  {'pf tok/s':>8s}  "
+          f"{'out_tok':>7s}  {'out tok/s':>9s}  {'score'}", flush=True)
+    print(f"  {'---':>3s}  {'---':<16s}  {'------':>6s}  {'-------':>7s}  {'--------':>8s}  "
+          f"{'-------':>7s}  {'---------':>9s}  {'-----'}", flush=True)
 
     for i, case in enumerate(cases):
         try:
-            result = _run_bench_case(
-                base_url, model, case, stream=use_stream,
-            )
+            result = _run_bench_case(base_url, model, case)
         except Exception as exc:
             result = {"id": case["id"], "ok": False, "error": repr(exc)}
-            print(f"  [{i+1:02d}/{len(cases)}] {case['id']}  FAILED: {exc}", flush=True)
+            print(f"  {i+1:3d}  {case['id']:<16s}  FAILED: {exc}", flush=True)
             results.append(result)
             continue
 
@@ -1615,27 +1657,27 @@ def _run_bench_suite(
             n_scored += 1
             if correct:
                 n_correct += 1
-            score_detail = f"  [{detail}]"
+            score_detail = "OK" if correct else "WRONG"
 
-        # Print progress
-        if use_stream:
-            ttft = result.get("first_token_seconds")
-            ttft_str = f"{ttft:.3f}s" if ttft is not None else "n/a"
-            bucket = case.get("bucket", "?")
-            print(
-                f"  [{i+1:02d}/{len(cases)}] {case['id']}  bucket={bucket}  "
-                f"TTFT={ttft_str}  total={result.get('seconds', 0):.2f}s  "
-                f"tokens={result.get('token_deltas', 0)}",
-                flush=True,
-            )
-        else:
-            print(
-                f"  [{i+1:02d}/{len(cases)}] {case['id']}  "
-                f"tok/s={result.get('tok_s', 0):.1f}  "
-                f"tokens={result.get('completion_tokens', 0)}  "
-                f"elapsed={result.get('seconds', 0):.2f}s{score_detail}",
-                flush=True,
-            )
+        # Format output line
+        wall_str = f"{result.get('wall_s', 0):.2f}s"
+        ttft = result.get("ttft_s")
+        ttft_str = f"{ttft:.3f}s" if ttft is not None else "n/a"
+        pf_tps = result.get("prefill_tok_s")
+        pf_str = f"{pf_tps:.0f}" if pf_tps is not None else "n/a"
+        out_tok = result.get("completion_tokens", 0)
+        out_tps = result.get("output_tok_s")
+        out_tps_str = f"{out_tps:.2f}" if out_tps is not None else "n/a"
+
+        bucket_tag = ""
+        if suite == "agent":
+            bucket_tag = f"[{case.get('bucket', '?')}] "
+
+        print(
+            f"  {i+1:3d}  {bucket_tag}{case['id']:<16s}  {wall_str:>6s}  {ttft_str:>7s}  "
+            f"{pf_str:>8s}  {out_tok:>7d}  {out_tps_str:>9s}  {score_detail}",
+            flush=True,
+        )
 
         results.append(result)
 
@@ -1648,53 +1690,60 @@ def _run_bench_suite(
         "results": results,
     }
 
-    if suite == "agent":
-        # Per-bucket aggregation
-        buckets: dict[str, list[dict[str, Any]]] = {}
-        for r in ok_results:
-            case_match = next((c for c in cases if c["id"] == r["id"]), None)
-            bucket = case_match.get("bucket", "unknown") if case_match else "unknown"
-            buckets.setdefault(bucket, []).append(r)
+    if ok_results:
+        walls = [r["wall_s"] for r in ok_results]
+        ttfts = [r["ttft_s"] for r in ok_results if r.get("ttft_s") is not None]
+        pf_tps_list = [r["prefill_tok_s"] for r in ok_results if r.get("prefill_tok_s") is not None]
+        out_tps_list = [r["output_tok_s"] for r in ok_results if r.get("output_tok_s") is not None]
+        out_toks = [r["completion_tokens"] for r in ok_results]
+        prompt_toks = [r["prompt_tokens"] for r in ok_results]
 
-        bucket_agg = {}
-        for bk, bk_results in sorted(buckets.items()):
-            ttfts = [r["first_token_seconds"] for r in bk_results if r.get("first_token_seconds") is not None]
-            totals = [r["seconds"] for r in bk_results]
-            tokens = [r["token_deltas"] for r in bk_results]
-            bucket_agg[bk] = {
-                "n": len(bk_results),
-                "mean_ttft_s": sum(ttfts) / len(ttfts) if ttfts else None,
-                "mean_total_s": sum(totals) / len(totals) if totals else 0.0,
-                "mean_tokens": sum(tokens) / len(tokens) if tokens else 0.0,
-            }
-            if ttfts:
-                tok_s_list = [t / (s - f) if (s - f) > 0 else 0
-                              for t, s, f in zip(tokens, totals, ttfts)
-                              if (s - f) > 0]
-                bucket_agg[bk]["mean_decode_tok_s"] = (
-                    sum(tok_s_list) / len(tok_s_list) if tok_s_list else None
-                )
-        agg["buckets"] = bucket_agg
-    else:
-        tok_s_values = [r["tok_s"] for r in ok_results if r.get("tok_s")]
-        agg["mean_tok_s"] = sum(tok_s_values) / len(tok_s_values) if tok_s_values else 0.0
+        agg["mean_wall_s"] = round(sum(walls) / len(walls), 3)
+        agg["mean_ttft_s"] = round(sum(ttfts) / len(ttfts), 4) if ttfts else None
+        agg["mean_prefill_tok_s"] = round(sum(pf_tps_list) / len(pf_tps_list), 1) if pf_tps_list else None
+        agg["mean_output_tok_s"] = round(sum(out_tps_list) / len(out_tps_list), 2) if out_tps_list else None
+        agg["total_output_tokens"] = sum(out_toks)
+        agg["total_prompt_tokens"] = sum(prompt_toks)
+
+        # Per-bucket aggregation for agent suite
+        if suite == "agent":
+            buckets: dict[str, list[dict[str, Any]]] = {}
+            for r in ok_results:
+                case_match = next((c for c in cases if c["id"] == r["id"]), None)
+                bucket = case_match.get("bucket", "unknown") if case_match else "unknown"
+                buckets.setdefault(bucket, []).append(r)
+            bucket_agg = {}
+            for bk, bk_results in sorted(buckets.items()):
+                bk_ttfts = [r["ttft_s"] for r in bk_results if r.get("ttft_s") is not None]
+                bk_pf = [r["prefill_tok_s"] for r in bk_results if r.get("prefill_tok_s") is not None]
+                bk_out = [r["output_tok_s"] for r in bk_results if r.get("output_tok_s") is not None]
+                bk_walls = [r["wall_s"] for r in bk_results]
+                bucket_agg[bk] = {
+                    "n": len(bk_results),
+                    "mean_ttft_s": round(sum(bk_ttfts) / len(bk_ttfts), 4) if bk_ttfts else None,
+                    "mean_prefill_tok_s": round(sum(bk_pf) / len(bk_pf), 1) if bk_pf else None,
+                    "mean_output_tok_s": round(sum(bk_out) / len(bk_out), 2) if bk_out else None,
+                    "mean_wall_s": round(sum(bk_walls) / len(bk_walls), 3),
+                }
+            agg["buckets"] = bucket_agg
 
     if n_scored > 0:
         agg["accuracy"] = f"{n_correct}/{n_scored}"
         agg["accuracy_pct"] = round(n_correct / n_scored * 100, 1)
 
     # Print suite summary
-    if suite == "agent" and agg.get("buckets"):
-        print(f"\n  [summary]", flush=True)
-        for bk, ba in agg["buckets"].items():
-            ttft_s = f"{ba['mean_ttft_s']:.3f}s" if ba.get("mean_ttft_s") is not None else "n/a"
-            dec_s = f"{ba.get('mean_decode_tok_s', 0):.1f}" if ba.get("mean_decode_tok_s") else "n/a"
-            print(f"    {bk}: TTFT={ttft_s}  total={ba['mean_total_s']:.2f}s  decode~{dec_s} tok/s", flush=True)
-    else:
-        summary = f"  [summary] mean_tok_s={agg.get('mean_tok_s', 0):.1f}  ok={agg['n_ok']}/{agg['n']}"
-        if n_scored > 0:
-            summary += f"  accuracy={agg['accuracy']} ({agg['accuracy_pct']}%)"
-        print(summary, flush=True)
+    print(f"\n  [summary] ok={agg['n_ok']}/{agg['n']}", end="", flush=True)
+    if agg.get("mean_wall_s"):
+        print(f"  wall={agg['mean_wall_s']:.2f}s", end="")
+    if agg.get("mean_ttft_s"):
+        print(f"  TTFT={agg['mean_ttft_s']:.3f}s", end="")
+    if agg.get("mean_prefill_tok_s"):
+        print(f"  prefill={agg['mean_prefill_tok_s']:.0f} tok/s", end="")
+    if agg.get("mean_output_tok_s"):
+        print(f"  output={agg['mean_output_tok_s']:.2f} tok/s", end="")
+    if n_scored > 0:
+        print(f"  accuracy={agg['accuracy']} ({agg['accuracy_pct']}%)", end="")
+    print(flush=True)
 
     return agg
 
@@ -1741,15 +1790,18 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
     # Final summary
     print(f"\n[bench] === SUMMARY ===", flush=True)
-    print(f"{'Suite':>8s}  {'OK':>4s}  {'tok/s':>7s}  {'Score':>10s}", flush=True)
+    print(f"{'Suite':>8s}  {'OK':>5s}  {'Wall':>7s}  {'TTFT':>7s}  {'Pf tok/s':>9s}  "
+          f"{'Out tok/s':>10s}  {'Out tok':>8s}  {'Score':>10s}", flush=True)
     for suite, s in all_suites.items():
         ok_str = f"{s['n_ok']}/{s['n']}"
-        if suite == "agent":
-            tok_s_str = "stream"
-        else:
-            tok_s_str = f"{s.get('mean_tok_s', 0):.1f}"
+        wall_str = f"{s.get('mean_wall_s', 0):.2f}s" if s.get("mean_wall_s") else "-"
+        ttft_str = f"{s['mean_ttft_s']:.3f}s" if s.get("mean_ttft_s") else "-"
+        pf_str = f"{s['mean_prefill_tok_s']:.0f}" if s.get("mean_prefill_tok_s") else "-"
+        out_str = f"{s['mean_output_tok_s']:.2f}" if s.get("mean_output_tok_s") else "-"
+        tok_str = str(s.get("total_output_tokens", 0))
         score_str = s.get("accuracy", "-")
-        print(f"{suite:>8s}  {ok_str:>4s}  {tok_s_str:>7s}  {score_str:>10s}", flush=True)
+        print(f"{suite:>8s}  {ok_str:>5s}  {wall_str:>7s}  {ttft_str:>7s}  "
+              f"{pf_str:>9s}  {out_str:>10s}  {tok_str:>8s}  {score_str:>10s}", flush=True)
 
     write_json(args.json_out, payload)
     return 0 if payload["ok"] else 1
