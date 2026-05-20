@@ -1011,11 +1011,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 if timing is not None:
                     timing["daemon_done"] = True
                 break
+            if timing is not None:
+                timing["raw_tokens"] = timing.get("raw_tokens", 0) + 1
+                timing.setdefault("first_raw_token", tok_id)
             if timing and timing.get("t_first_tok") is None:
                 timing["t_first_tok"] = time.monotonic()
             if hit_stop:
                 continue
             if tok_id in stop_ids:
+                if timing is not None:
+                    timing["stop_id_tokens"] = timing.get("stop_id_tokens", 0) + 1
+                    timing.setdefault("first_stop_id_token", tok_id)
                 hit_stop = True
                 continue
             generated += 1
@@ -1048,11 +1054,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 if timing is not None:
                     timing["daemon_done"] = True
                 break
+            if timing is not None:
+                timing["raw_tokens"] = timing.get("raw_tokens", 0) + 1
+                timing.setdefault("first_raw_token", tok_id)
             if timing and timing.get("t_first_tok") is None:
                 timing["t_first_tok"] = time.monotonic()
             if hit_stop:
                 continue
             if tok_id in stop_ids:
+                if timing is not None:
+                    timing["stop_id_tokens"] = timing.get("stop_id_tokens", 0) + 1
+                    timing.setdefault("first_stop_id_token", tok_id)
                 hit_stop = True
                 continue
             generated += 1
@@ -1240,6 +1252,31 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     def _retain_stream_prompt_file(path: Path | None) -> None:
         if path is not None:
             log.debug("retaining stream prompt .bin: %s", path)
+
+    def _log_zero_visible_output(kind: str, request_id: str, req, timing: dict,
+                                 prompt_len: int, finish_reason: str = "stop") -> None:
+        raw_tokens = int(timing.get("raw_tokens", 0) or 0)
+        if raw_tokens <= 0:
+            return
+        first_raw = timing.get("first_raw_token")
+        first_stop = timing.get("first_stop_id_token")
+        try:
+            first_piece = tokenizer.decode([first_raw]) if first_raw is not None else ""
+        except Exception:
+            first_piece = ""
+        messages = getattr(req, "messages", None)
+        last_role = None
+        if messages:
+            last_role = getattr(messages[-1], "role", None)
+        log.warning(
+            "%s zero visible output %s: raw_tokens=%d first_raw_token=%s "
+            "first_raw_text=%r stop_id=%s stop_id_tokens=%d first_stop_id_token=%s "
+            "last_role=%s prompt_tokens=%d finish=%s",
+            kind, request_id, raw_tokens, first_raw, first_piece[:80],
+            first_raw in stop_ids if first_raw is not None else False,
+            int(timing.get("stop_id_tokens", 0) or 0), first_stop,
+            last_role, prompt_len, finish_reason,
+        )
 
     # ── /v1/chat/completions ────────────────────────────────────────────────
 
@@ -1512,6 +1549,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         yield f"data: {json.dumps(usage_chunk)}\n\n"
                     elapsed = time.monotonic() - t0
                     tok_s = completion_tokens / elapsed if elapsed > 0 else 0.0
+                    if completion_tokens == 0:
+                        _log_zero_visible_output(
+                            "chat.stream", completion_id, req, timing,
+                            prompt_len, finish_reason)
                     log.info(
                         "chat DONE %s  in=%d out=%d  %.1fs  %.1f tok/s  finish=%s  %s",
                         completion_id, prompt_len, completion_tokens,
@@ -1621,6 +1662,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
         elapsed = time.monotonic() - t0
         tok_s = len(tokens) / elapsed if elapsed > 0 else 0.0
+        if len(tokens) == 0:
+            _log_zero_visible_output(
+                "chat", completion_id, req, timing, prompt_len, finish_reason)
         log.info(
             "chat DONE %s  in=%d out=%d  %.1fs  %.1f tok/s  finish=%s  %s",
             completion_id, prompt_len, len(tokens),
@@ -1878,6 +1922,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     finish_reason = "tool_use" if tool_calls else "end_turn"
                     elapsed = time.monotonic() - t0
                     tok_s = out_tokens / elapsed if elapsed > 0 else 0.0
+                    if out_tokens == 0:
+                        _log_zero_visible_output(
+                            "messages.stream", msg_id, req, timing,
+                            prompt_len, finish_reason)
                     log.info(
                         "messages DONE %s  in=%d out=%d  %.1fs  %.1f tok/s  finish=%s  %s",
                         msg_id, prompt_len, out_tokens, elapsed, tok_s,
@@ -1979,6 +2027,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         finish_reason = "tool_use" if tool_calls else "end_turn"
         elapsed = time.monotonic() - t0
         tok_s = len(tokens) / elapsed if elapsed > 0 else 0.0
+        if len(tokens) == 0:
+            _log_zero_visible_output(
+                "messages", msg_id, req, timing, prompt_len, finish_reason)
         log.info(
             "messages DONE %s  in=%d out=%d  %.1fs  %.1f tok/s  finish=%s  %s",
             msg_id, prompt_len, len(tokens), elapsed, tok_s, finish_reason,
@@ -2256,6 +2307,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         out_types = [o.get("type") for o in output]
         elapsed = time.monotonic() - t0
         tok_s = len(tokens) / elapsed if elapsed > 0 else 0.0
+        if len(tokens) == 0:
+            _log_zero_visible_output(
+                "responses", response_id, chat_req, timing, prompt_len,
+                "completed")
         log.info(
             "responses DONE %s  in=%d out=%d  %.1fs  %.1f tok/s  output=%s  text_len=%d  %s",
             response_id, prompt_len, len(tokens),
@@ -2544,6 +2599,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 out_types = [o.get("type") for o in final_output]
                 elapsed = time.monotonic() - t0
                 tok_s = completion_tokens / elapsed if elapsed > 0 else 0.0
+                if completion_tokens == 0:
+                    _log_zero_visible_output(
+                        "responses.stream", response_id, chat_req, timing,
+                        prompt_len, "completed")
                 log.info(
                     "responses DONE %s  in=%d out=%d  %.1fs  %.1f tok/s  output=%s  text_len=%d  %s",
                     response_id, prompt_len, completion_tokens,
