@@ -80,8 +80,10 @@ private:
     static constexpr int PREFIX_SLOTS = 64;
     Gemma4Snapshot        snapshots_[PREFIX_SLOTS];
 
-    // Prefill prompt tokens in chunks, return committed position.
-    int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io);
+    // Prefill prompt tokens in chunks, return absolute committed position.
+    // kv_offset: starting KV cache position (0 for fresh prefill, snap_pos for restore).
+    int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
+                   int kv_offset = 0);
 
     // Autoregressive decode loop.
     bool do_decode(int committed, int n_gen,

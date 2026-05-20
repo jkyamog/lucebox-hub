@@ -79,7 +79,8 @@ struct Gemma4Weights {
     // Global tensors
     ggml_tensor * tok_embd               = nullptr;  // [n_embd, n_vocab]
     ggml_tensor * out_norm               = nullptr;  // [n_embd]
-    ggml_tensor * output                 = nullptr;  // [n_embd, n_vocab] (lm_head)
+    ggml_tensor * output                 = nullptr;  // [n_embd, n_vocab] (lm_head, may be tied to tok_embd)
+    ggml_tensor * rope_freqs_global      = nullptr;  // [head_dim/2] global rope freq factors
     ggml_tensor * per_layer_tok_embd     = nullptr;  // [n_embd_per_layer * n_layer, n_vocab]
     ggml_tensor * per_layer_model_proj   = nullptr;  // [n_embd, n_embd_per_layer * n_layer]
     ggml_tensor * per_layer_proj_norm    = nullptr;  // [n_embd_per_layer * n_layer]
@@ -91,8 +92,9 @@ struct Gemma4Weights {
     // Architecture metadata
     int n_layer               = 0;
     int n_head                = 0;
-    int n_head_kv             = 0;
-    int head_dim              = 128;
+    int n_head_kv             = 0;       // max n_head_kv (for backward compat)
+    int head_dim              = 128;     // head_dim for SWA layers (smaller)
+    int head_dim_full         = 128;     // head_dim for full-attention layers
     int n_embd                = 0;
     int n_ff                  = 0;       // dense FFN intermediate
     int n_ff_exp              = 0;       // expert FFN intermediate
@@ -102,6 +104,9 @@ struct Gemma4Weights {
     int n_layer_dense_lead    = 1;
     int n_embd_per_layer      = 0;       // per-layer embedding dim
     int n_vocab               = 0;
+
+    // Per-layer head counts (Gemma4 can have variable n_head_kv per layer)
+    std::vector<int> n_head_kv_per_layer;
 
     // iSWA
     int  sliding_window       = 0;
@@ -130,6 +135,15 @@ inline bool gemma4_is_swa_layer(const Gemma4Weights & w, int il) {
 
 inline bool gemma4_has_kv(const Gemma4Weights & w, int il) {
     return il < (int)w.has_kv.size() && w.has_kv[il];
+}
+
+inline int gemma4_head_dim(const Gemma4Weights & w, int il) {
+    return gemma4_is_swa_layer(w, il) ? w.head_dim : w.head_dim_full;
+}
+
+inline int gemma4_n_head_kv(const Gemma4Weights & w, int il) {
+    if (il < (int)w.n_head_kv_per_layer.size()) return w.n_head_kv_per_layer[il];
+    return w.n_head_kv;
 }
 
 // GGUF loader
@@ -172,11 +186,14 @@ void free_gemma4_snapshot(Gemma4Snapshot & s);
 
 // Forward: run a single step (prefill chunk or decode token).
 // Returns logits for last token.
+// token_ids: raw token IDs needed for per-layer embedding lookup (may be nullptr
+//            if the model has no per-layer embeddings).
 bool gemma4_step(
     ggml_backend_t          backend,
     const Gemma4Weights &   w,
     Gemma4Cache &           cache,
     const float *           embed,
+    const int32_t *         token_ids,
     int                     n_tokens,
     int                     kv_start,
     std::vector<float> &    out_logits);

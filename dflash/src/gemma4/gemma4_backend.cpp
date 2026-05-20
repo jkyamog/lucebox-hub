@@ -1,6 +1,6 @@
 // Gemma4Backend implementation.
 //
-// Uses gemma4_step() for forward pass (currently stubbed).
+// Uses gemma4_step() for forward pass with per-layer embedding support.
 // Structure mirrors Qwen3Backend: prefill in chunks, autoregressive decode,
 // KV cache with layer sharing, snapshot/restore.
 
@@ -84,7 +84,7 @@ bool Gemma4Backend::unpark(const std::string & what) {
 // ── Prefill ────────────────────────────────────────────────────────────
 
 int Gemma4Backend::do_prefill(const std::vector<int32_t> & tokens,
-                               const DaemonIO & io) {
+                               const DaemonIO & io, int kv_offset) {
     (void)io;
     const int n = (int)tokens.size();
     const int hidden = w_.n_embd;
@@ -104,16 +104,18 @@ int Gemma4Backend::do_prefill(const std::vector<int32_t> & tokens,
         float scale = std::sqrt((float)hidden);
         for (int i = 0; i < len * hidden; ++i) embed[i] *= scale;
 
-        if (!gemma4_step(backend_, w_, cache_, embed.data(), len, pos, logits)) {
-            std::fprintf(stderr, "[gemma4] prefill step failed at pos=%d\n", pos);
+        const int kv_pos = kv_offset + pos;
+        if (!gemma4_step(backend_, w_, cache_, embed.data(),
+                         tokens.data() + pos, len, kv_pos, logits)) {
+            std::fprintf(stderr, "[gemma4] prefill step failed at pos=%d\n", kv_pos);
             return -1;
         }
 
         pos += len;
-        cache_.cur_pos = pos;
+        cache_.cur_pos = kv_offset + pos;
     }
 
-    return pos;
+    return kv_offset + pos;
 }
 
 // ── Decode ─────────────────────────────────────────────────────────────
@@ -134,7 +136,8 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
         float scale = std::sqrt((float)hidden);
         for (int j = 0; j < hidden; ++j) embed_buf[j] *= scale;
 
-        if (!gemma4_step(backend_, w_, cache_, embed_buf.data(), 1, committed, logits)) {
+        if (!gemma4_step(backend_, w_, cache_, embed_buf.data(),
+                         &tok, 1, committed, logits)) {
             return false;
         }
 
@@ -177,7 +180,7 @@ GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
 
     cache_.cur_pos = 0;
 
-    const int committed = do_prefill(req.prompt, out_io);
+    const int committed = do_prefill(req.prompt, out_io, /*kv_offset=*/0);
     if (committed < 0) {
         result.error = "prefill";
         return result;
@@ -195,8 +198,8 @@ GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
         float scale = std::sqrt((float)hidden);
         for (int j = 0; j < hidden; ++j) embed_buf[j] *= scale;
 
-        if (!gemma4_step(backend_, w_, cache_, embed_buf.data(), 1,
-                         committed - 1, logits)) {
+        if (!gemma4_step(backend_, w_, cache_, embed_buf.data(),
+                         &last_tok, 1, committed - 1, logits)) {
             result.error = "first logits";
             return result;
         }
@@ -246,9 +249,11 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
                                                      const GenerateRequest & req,
                                                      const DaemonIO & io) {
     GenerateResult result;
+    DaemonIO out_io = io.with_token_callback(req.on_token);
+
     if (slot < 0 || slot >= PREFIX_SLOTS || !snapshots_[slot].ctx) {
         result.error = "bad slot";
-        io.emit(-1);
+        out_io.emit(-1);
         return result;
     }
 
@@ -261,9 +266,91 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
             ggml_backend_tensor_set(cache_.v[il], snap.v_snap[il]->data, 0, nbytes);
         }
     }
-    cache_.cur_pos = snap.cur_pos;
 
-    return generate(req, io);
+    const int snap_pos = snap.cur_pos;
+    cache_.cur_pos = snap_pos;
+
+    // Set up sampler
+    sampler_ = req.sampler;
+    if (req.do_sample && sampler_.seed != 0) {
+        sampler_rng_.seed(sampler_.seed);
+    }
+
+    // Diff-prefill: only prefill tokens beyond the cached prefix
+    const int prompt_len = (int)req.prompt.size();
+    int committed = snap_pos;
+
+    if (prompt_len > snap_pos) {
+        // Compute delta (tokens after the snapshot)
+        std::vector<int32_t> delta(req.prompt.begin() + snap_pos, req.prompt.end());
+        committed = do_prefill(delta, out_io, /*kv_offset=*/snap_pos);
+        if (committed < 0) {
+            result.error = "prefill";
+            return result;
+        }
+    } else if (prompt_len > 0 && prompt_len < snap_pos) {
+        result.error = "snapshot_longer_than_prompt";
+        out_io.emit(-1);
+        return result;
+    }
+    // else: prompt_len == snap_pos → no delta, committed stays at snap_pos
+
+    // Generate
+    if (req.n_gen > 0) {
+        const int hidden = w_.n_embd;
+        const int vocab  = w_.n_vocab;
+        std::vector<float> logits;
+
+        // Re-step last token to get logits for first generated token
+        int32_t last_tok = req.prompt.back();
+        std::vector<float> embed_buf(hidden);
+        w_.embedder.embed(&last_tok, 1, embed_buf.data());
+        float scale = std::sqrt((float)hidden);
+        for (int j = 0; j < hidden; ++j) embed_buf[j] *= scale;
+
+        if (!gemma4_step(backend_, w_, cache_, embed_buf.data(),
+                         &last_tok, 1, committed - 1, logits)) {
+            result.error = "first logits";
+            return result;
+        }
+
+        // Sample first token
+        int32_t first;
+        if (sampler_.temp > 0) {
+            first = sample_logits(logits.data(), vocab, sampler_,
+                                   result.tokens, sampler_rng_);
+        } else {
+            first = 0;
+            float best = logits[0];
+            for (int j = 1; j < vocab; ++j) {
+                if (logits[j] > best) { best = logits[j]; first = j; }
+            }
+        }
+        result.tokens.push_back(first);
+        out_io.emit(first);
+        if (out_io.cancelled) {
+            out_io.emit(-1);
+            result.ok = true;
+            return result;
+        }
+
+        if (first == w_.eos_id || first == w_.eos_chat_id) {
+            out_io.emit(-1);
+            result.ok = true;
+            return result;
+        }
+
+        if (req.n_gen > 1) {
+            if (!do_decode(committed, req.n_gen - 1, result.tokens, out_io)) {
+                result.error = "decode";
+                return result;
+            }
+        }
+    }
+
+    out_io.emit(-1);
+    result.ok = true;
+    return result;
 }
 
 // ── Snapshots ──────────────────────────────────────────────────────────

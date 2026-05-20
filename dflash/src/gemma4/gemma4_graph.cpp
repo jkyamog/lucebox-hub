@@ -150,9 +150,9 @@ static ggml_tensor * build_gemma4_attn_block(
     int kv_start,
     int n_tokens)
 {
-    const int head_dim   = w.head_dim;
+    const int head_dim   = gemma4_head_dim(w, il);
     const int n_head     = w.n_head;
-    const int n_head_kv  = w.n_head_kv;
+    const int n_head_kv  = gemma4_n_head_kv(w, il);
     const int q_dim      = n_head * head_dim;
     const bool is_swa    = gemma4_is_swa_layer(w, il);
     const bool has_kv    = gemma4_has_kv(w, il);
@@ -168,7 +168,7 @@ static ggml_tensor * build_gemma4_attn_block(
 
     // RoPE for Q
     const float rope_base = is_swa ? w.rope_freq_base_swa : w.rope_freq_base_full;
-    ggml_tensor * freq_factors = is_swa ? nullptr : L.rope_freqs;
+    ggml_tensor * freq_factors = is_swa ? nullptr : (L.rope_freqs ? L.rope_freqs : w.rope_freqs_global);
     Qcur = ggml_rope_ext(ctx, Qcur, positions, freq_factors,
                           head_dim, GGML_ROPE_TYPE_NEOX,
                           0, rope_base, 1.0f,
@@ -216,7 +216,9 @@ static ggml_tensor * build_gemma4_attn_block(
     // else: KV-sharing layer — cache already written by source layer
 
     // Flash attention
-    const int kv_len = kv_start + n_tokens;
+    // Pad kv_len to multiple of 256 for CUDA FA kernel compatibility (FATTN_KQ_STRIDE=256)
+    const int kv_len_raw = kv_start + n_tokens;
+    const int kv_len = (kv_len_raw + 255) & ~255;  // round up to 256
 
     ggml_tensor * Qfa = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
     Qfa = ggml_cont(ctx, Qfa);
@@ -315,11 +317,19 @@ static ggml_tensor * build_gemma4_layer(
     return cur;
 }
 
+// Helper: get a 2D slice from a 3D tensor along ne[2] (same as llama.cpp ggml_view_2d_slice).
+static ggml_tensor * gemma4_view_2d_slice(ggml_context * ctx, ggml_tensor * x, int idx) {
+    return ggml_view_2d(ctx, x, x->ne[0], x->ne[1],
+                        ggml_row_size(x->type, x->ne[0]),
+                        (size_t)idx * x->ne[0] * x->ne[1] * ggml_element_size(x));
+}
+
 bool gemma4_step(
     ggml_backend_t          backend,
     const Gemma4Weights &   w,
     Gemma4Cache &           cache,
     const float *           embed,
+    const int32_t *         token_ids,
     int                     n_tokens,
     int                     kv_start,
     std::vector<float> &    out_logits)
@@ -337,32 +347,65 @@ bool gemma4_step(
     ggml_tensor * pp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_input(pp);
 
+    // Token IDs input (for per-layer embedding lookup)
+    ggml_tensor * tok_ids = nullptr;
+    if (token_ids && w.per_layer_tok_embd && w.per_layer_model_proj && w.n_embd_per_layer > 0) {
+        tok_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(tok_ids);
+    }
+
     // Attention masks (full + SWA)
-    const int kv_len = kv_start + n_tokens;
-    ggml_tensor * mk_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len, n_tokens, 1, 1);
+    // Pad kv_len to 256 for CUDA FA kernel compatibility (FATTN_KQ_STRIDE=256)
+    const int kv_len_raw = kv_start + n_tokens;
+    const int kv_len_padded = (kv_len_raw + 255) & ~255;
+    ggml_tensor * mk_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len_padded, n_tokens, 1, 1);
     ggml_set_input(mk_full);
     ggml_tensor * mk_full_f16 = ggml_cast(ctx, mk_full, GGML_TYPE_F16);
-    ggml_tensor * mk_swa = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len, n_tokens, 1, 1);
+    ggml_tensor * mk_swa = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len_padded, n_tokens, 1, 1);
     ggml_set_input(mk_swa);
     ggml_tensor * mk_swa_f16 = ggml_cast(ctx, mk_swa, GGML_TYPE_F16);
 
-    // Per-layer embedding input (if model has per-layer embeddings)
-    // For simplicity, we precompute per-layer inputs for all layers at once
-    // Shape: [n_embd_per_layer, n_tokens, n_layer] → slice per layer
-    ggml_tensor * per_layer_all = nullptr;
-    if (w.per_layer_tok_embd && w.per_layer_model_proj && w.n_embd_per_layer > 0) {
-        // We need token IDs for per-layer embedding lookup, but we only have
-        // float embeddings at this point. Per-layer embedding requires a separate
-        // token ID input. For now, skip per-layer embeddings in the step function
-        // (they're computed on the embedding path in the backend).
-        // TODO: Add token ID input to gemma4_step for per-layer embedding support.
+    // Per-layer embedding computation (reference: gemma4-iswa.cpp build_inp_per_layer + project_per_layer_inputs)
+    ggml_tensor * per_layer_all = nullptr;  // final shape: [n_embd_per_layer, n_tokens, n_layer]
+    if (tok_ids) {
+        const int D = w.n_embd_per_layer;
+        const int L = w.n_layer;
+
+        // 1. Token per-layer embedding lookup + scale
+        //    get_rows(per_layer_tok_embd[D*L, n_vocab], tok_ids) → [D*L, n_tokens]
+        ggml_tensor * inp_pl = ggml_get_rows(ctx, w.per_layer_tok_embd, tok_ids);
+        inp_pl = ggml_reshape_3d(ctx, inp_pl, D, L, n_tokens);  // [D, L, n_tokens]
+        inp_pl = ggml_scale(ctx, inp_pl, std::sqrt((float)D));
+
+        // 2. Project main embedding through per_layer_model_proj
+        //    mul_mat(per_layer_model_proj[n_embd, D*L], ie[n_embd, n_tokens]) → [D*L, n_tokens]
+        ggml_tensor * proj = ggml_mul_mat(ctx, w.per_layer_model_proj, ie);
+        proj = ggml_scale(ctx, proj, 1.0f / std::sqrt((float)w.n_embd));
+        proj = ggml_reshape_3d(ctx, proj, D, L, n_tokens);  // [D, L, n_tokens]
+
+        // 3. RMS norm on projection (normalizes over ne[0]=D for each (layer, token))
+        proj = ggml_rms_norm(ctx, proj, w.norm_eps);
+        // Reshape norm weight from [D*L] to [D, L] for broadcast mul over n_tokens
+        ggml_tensor * norm_w = ggml_reshape_2d(ctx, w.per_layer_proj_norm, D, L);
+        proj = ggml_mul(ctx, proj, norm_w);
+
+        // 4. Add token embedding + projection, scale by 1/sqrt(2)
+        per_layer_all = ggml_add(ctx, proj, inp_pl);
+        per_layer_all = ggml_scale(ctx, per_layer_all, 1.0f / std::sqrt(2.0f));
+
+        // 5. Permute to [D, n_tokens, L] for easy per-layer slicing
+        per_layer_all = ggml_cont(ctx, ggml_permute(ctx, per_layer_all, 0, 2, 1, 3));
     }
 
     // Build the graph
     ggml_tensor * cur = ie;  // [n_embd, n_tokens] already scaled by sqrt(n_embd) in caller
 
     for (int il = 0; il < w.n_layer; ++il) {
-        ggml_tensor * pl_input = nullptr;  // TODO: per-layer embedding per layer
+        ggml_tensor * pl_input = nullptr;
+        if (per_layer_all) {
+            // Slice [n_embd_per_layer, n_tokens] for this layer
+            pl_input = gemma4_view_2d_slice(ctx, per_layer_all, il);
+        }
         cur = build_gemma4_layer(ctx, gf, w, cache, il, cur, pp,
                                    mk_full_f16, mk_swa_f16, pl_input,
                                    kv_start, n_tokens);
@@ -406,24 +449,29 @@ bool gemma4_step(
     for (int i = 0; i < n_tokens; ++i) pos[i] = kv_start + i;
     ggml_backend_tensor_set(pp, pos.data(), 0, ggml_nbytes(pp));
 
-    // Causal mask (full attention)
-    std::vector<float> mfull((size_t)kv_len * n_tokens, -INFINITY);
+    // Set token IDs for per-layer embedding
+    if (tok_ids && token_ids) {
+        ggml_backend_tensor_set(tok_ids, token_ids, 0, (size_t)n_tokens * sizeof(int32_t));
+    }
+
+    // Causal mask (full attention) — padded positions are masked with -inf
+    std::vector<float> mfull((size_t)kv_len_padded * n_tokens, -INFINITY);
     for (int q = 0; q < n_tokens; ++q) {
         const int abs_q = kv_start + q;
-        for (int k = 0; k <= abs_q && k < kv_len; ++k) {
-            mfull[(size_t)q * kv_len + k] = 0.0f;
+        for (int k = 0; k <= abs_q && k < kv_len_raw; ++k) {
+            mfull[(size_t)q * kv_len_padded + k] = 0.0f;
         }
     }
     ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
 
-    // SWA mask
-    std::vector<float> mswa((size_t)kv_len * n_tokens, -INFINITY);
+    // SWA mask — padded positions are masked with -inf
+    std::vector<float> mswa((size_t)kv_len_padded * n_tokens, -INFINITY);
     const int W = w.sliding_window;
     for (int q = 0; q < n_tokens; ++q) {
         const int abs_q = kv_start + q;
         const int win_lo = std::max(0, abs_q - W + 1);
-        for (int k = win_lo; k <= abs_q && k < kv_len; ++k) {
-            mswa[(size_t)q * kv_len + k] = 0.0f;
+        for (int k = win_lo; k <= abs_q && k < kv_len_raw; ++k) {
+            mswa[(size_t)q * kv_len_padded + k] = 0.0f;
         }
     }
     ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
@@ -440,7 +488,7 @@ bool gemma4_step(
     ggml_backend_tensor_get(cur, out_logits.data(), 0,
                              out_logits.size() * sizeof(float));
 
-    cache.cur_pos = kv_len;
+    cache.cur_pos = kv_len_raw;
     ggml_free(ctx);
     return true;
 }
