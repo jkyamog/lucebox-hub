@@ -1253,6 +1253,37 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         if path is not None:
             log.debug("retaining stream prompt .bin: %s", path)
 
+    async def _drain_abandoned_stream(kind: str, request_id: str,
+                                      timing: dict) -> None:
+        """Synchronize the daemon stream after an abandoned SSE response.
+
+        If the client disconnects while the daemon is still generating, the
+        daemon continues writing token IDs to r_pipe.  Releasing daemon_lock
+        before consuming the sentinel lets the next request read stale tokens.
+        Drain to -1 here so the next request starts from a clean pipe.
+        """
+        if timing.get("daemon_done"):
+            return
+        loop = asyncio.get_running_loop()
+        drain_fut = loop.run_in_executor(None, _drain_until_sentinel, r_pipe)
+        cancelled = False
+        while True:
+            try:
+                drained = await asyncio.shield(drain_fut)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                log.warning(
+                    "%s stream cancellation deferred until daemon sentinel %s",
+                    kind, request_id)
+        timing["daemon_done"] = True
+        timing["abandoned_stream_drained_tokens"] = len(drained)
+        log.warning(
+            "%s stream abandoned %s: drained %d stale daemon tokens",
+            kind, request_id, len(drained))
+        if cancelled:
+            raise asyncio.CancelledError
+
     def _log_zero_visible_output(kind: str, request_id: str, req, timing: dict,
                                  prompt_len: int, finish_reason: str = "stop") -> None:
         raw_tokens = int(timing.get("raw_tokens", 0) or 0)
@@ -1529,6 +1560,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             log.warning(
                                 "stream ended before daemon sentinel; "
                                 "retaining prompt .bin for in-flight daemon read")
+                            await _drain_abandoned_stream(
+                                "chat.stream", completion_id, timing)
 
                     inline_snap_ok = _consume_inline_snap_waiter(snap_waiter)
                     _confirm_or_abort_snap(
@@ -1858,6 +1891,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             log.warning(
                                 "stream ended before daemon sentinel; "
                                 "retaining prompt .bin for in-flight daemon read")
+                            await _drain_abandoned_stream(
+                                "messages.stream", msg_id, timing)
 
                     inline_snap_ok = _consume_inline_snap_waiter(snap_waiter)
                     _confirm_or_abort_snap(
@@ -2504,6 +2539,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         log.warning(
                             "stream ended before daemon sentinel; "
                             "retaining prompt .bin for in-flight daemon read")
+                        await _drain_abandoned_stream(
+                            "responses.stream", response_id, timing)
 
                 inline_snap_ok = _consume_inline_snap_waiter(snap_waiter)
                 _confirm_or_abort_snap(
