@@ -493,4 +493,214 @@ bool gemma4_step(
     return true;
 }
 
+// ── gemma4_verify_batch ─────────────────────────────────────────────────
+// Like gemma4_step but returns argmax for ALL token positions (not just last).
+
+bool gemma4_verify_batch(
+    ggml_backend_t          backend,
+    const Gemma4Weights &   w,
+    Gemma4Cache &           cache,
+    const float *           embed,
+    const int32_t *         token_ids,
+    int                     n_tokens,
+    int                     kv_start,
+    std::vector<int32_t> &  out_argmax)
+{
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() + 16 * 1024 * 1024;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
+
+    // Input tensors
+    ggml_tensor * ie = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
+    ggml_set_input(ie);
+    ggml_tensor * pp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(pp);
+
+    // Token IDs for per-layer embedding
+    ggml_tensor * tok_ids = nullptr;
+    if (token_ids && w.per_layer_tok_embd && w.per_layer_model_proj && w.n_embd_per_layer > 0) {
+        tok_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(tok_ids);
+    }
+
+    // Attention masks (padded)
+    const int kv_len_raw = kv_start + n_tokens;
+    const int kv_len_padded = (kv_len_raw + 255) & ~255;
+    ggml_tensor * mk_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len_padded, n_tokens, 1, 1);
+    ggml_set_input(mk_full);
+    ggml_tensor * mk_full_f16 = ggml_cast(ctx, mk_full, GGML_TYPE_F16);
+    ggml_tensor * mk_swa = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len_padded, n_tokens, 1, 1);
+    ggml_set_input(mk_swa);
+    ggml_tensor * mk_swa_f16 = ggml_cast(ctx, mk_swa, GGML_TYPE_F16);
+
+    // Per-layer embedding computation (same as gemma4_step)
+    ggml_tensor * per_layer_all = nullptr;
+    if (tok_ids) {
+        const int D = w.n_embd_per_layer;
+        const int L = w.n_layer;
+        ggml_tensor * inp_pl = ggml_get_rows(ctx, w.per_layer_tok_embd, tok_ids);
+        inp_pl = ggml_reshape_3d(ctx, inp_pl, D, L, n_tokens);
+        inp_pl = ggml_scale(ctx, inp_pl, std::sqrt((float)D));
+        ggml_tensor * proj = ggml_mul_mat(ctx, w.per_layer_model_proj, ie);
+        proj = ggml_scale(ctx, proj, 1.0f / std::sqrt((float)w.n_embd));
+        proj = ggml_reshape_3d(ctx, proj, D, L, n_tokens);
+        proj = ggml_rms_norm(ctx, proj, w.norm_eps);
+        ggml_tensor * norm_w = ggml_reshape_2d(ctx, w.per_layer_proj_norm, D, L);
+        proj = ggml_mul(ctx, proj, norm_w);
+        per_layer_all = ggml_add(ctx, proj, inp_pl);
+        per_layer_all = ggml_scale(ctx, per_layer_all, 1.0f / std::sqrt(2.0f));
+        per_layer_all = ggml_cont(ctx, ggml_permute(ctx, per_layer_all, 0, 2, 1, 3));
+    }
+
+    // Build graph (all layers)
+    ggml_tensor * cur = ie;
+    for (int il = 0; il < w.n_layer; ++il) {
+        ggml_tensor * pl_input = nullptr;
+        if (per_layer_all) {
+            pl_input = gemma4_view_2d_slice(ctx, per_layer_all, il);
+        }
+        cur = build_gemma4_layer(ctx, gf, w, cache, il, cur, pp,
+                                   mk_full_f16, mk_swa_f16, pl_input,
+                                   kv_start, n_tokens);
+    }
+
+    // Final norm
+    cur = gemma4_rms_norm_mul(ctx, cur, w.out_norm, w.norm_eps);
+
+    // lm_head for ALL tokens (no slicing)
+    cur = ggml_mul_mat(ctx, w.output, cur);  // [n_vocab, n_tokens]
+
+    // Logit softcapping
+    if (w.final_logit_softcap > 0.0f) {
+        cur = ggml_scale(ctx, cur, 1.0f / w.final_logit_softcap);
+        cur = ggml_tanh(ctx, cur);
+        cur = ggml_scale(ctx, cur, w.final_logit_softcap);
+    }
+
+    // Argmax per token
+    cur = ggml_argmax(ctx, cur);  // [n_tokens]
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+
+    // Allocate
+    static ggml_gallocr_t galloc_verify = nullptr;
+    if (!galloc_verify) galloc_verify = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(galloc_verify, gf)) {
+        std::fprintf(stderr, "gemma4_verify_batch: gallocr_alloc_graph failed\n");
+        ggml_free(ctx);
+        return false;
+    }
+
+    // Set inputs
+    ggml_backend_tensor_set(ie, embed, 0, ggml_nbytes(ie));
+    std::vector<int32_t> pos((size_t)n_tokens);
+    for (int i = 0; i < n_tokens; ++i) pos[i] = kv_start + i;
+    ggml_backend_tensor_set(pp, pos.data(), 0, ggml_nbytes(pp));
+
+    if (tok_ids && token_ids) {
+        ggml_backend_tensor_set(tok_ids, token_ids, 0, (size_t)n_tokens * sizeof(int32_t));
+    }
+
+    // Masks
+    std::vector<float> mfull((size_t)kv_len_padded * n_tokens, -INFINITY);
+    for (int q = 0; q < n_tokens; ++q) {
+        const int abs_q = kv_start + q;
+        for (int k = 0; k <= abs_q && k < kv_len_raw; ++k) {
+            mfull[(size_t)q * kv_len_padded + k] = 0.0f;
+        }
+    }
+    ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
+
+    std::vector<float> mswa((size_t)kv_len_padded * n_tokens, -INFINITY);
+    const int W = w.sliding_window;
+    for (int q = 0; q < n_tokens; ++q) {
+        const int abs_q = kv_start + q;
+        const int win_lo = std::max(0, abs_q - W + 1);
+        for (int k = win_lo; k <= abs_q && k < kv_len_raw; ++k) {
+            mswa[(size_t)q * kv_len_padded + k] = 0.0f;
+        }
+    }
+    ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
+
+    // Compute
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "gemma4_verify_batch: graph_compute failed\n");
+        ggml_free(ctx);
+        return false;
+    }
+
+    // Read argmax
+    out_argmax.resize(n_tokens);
+    ggml_backend_tensor_get(cur, out_argmax.data(), 0, sizeof(int32_t) * n_tokens);
+
+    cache.cur_pos = kv_len_raw;
+    ggml_free(ctx);
+    return true;
+}
+
+// ── gemma4_project_hidden ───────────────────────────────────────────────
+// Runs out_norm + lm_head + softcap + argmax on external hidden states.
+
+bool gemma4_project_hidden(
+    ggml_backend_t          backend,
+    const Gemma4Weights &   w,
+    const float *           hidden,
+    int                     n_tokens,
+    std::vector<int32_t> &  out_tokens)
+{
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead() + 1024 * 1024;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+
+    // Input: hidden states [n_embd, n_tokens]
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
+    ggml_set_input(inp);
+
+    // out_norm + lm_head
+    ggml_tensor * cur = gemma4_rms_norm_mul(ctx, inp, w.out_norm, w.norm_eps);
+    cur = ggml_mul_mat(ctx, w.output, cur);  // [n_vocab, n_tokens]
+
+    // Logit softcapping
+    if (w.final_logit_softcap > 0.0f) {
+        cur = ggml_scale(ctx, cur, 1.0f / w.final_logit_softcap);
+        cur = ggml_tanh(ctx, cur);
+        cur = ggml_scale(ctx, cur, w.final_logit_softcap);
+    }
+
+    // Argmax
+    cur = ggml_argmax(ctx, cur);  // [n_tokens]
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+
+    // Allocate
+    static ggml_gallocr_t galloc_proj = nullptr;
+    if (!galloc_proj) galloc_proj = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(galloc_proj, gf)) {
+        std::fprintf(stderr, "gemma4_project_hidden: gallocr_alloc_graph failed\n");
+        ggml_free(ctx);
+        return false;
+    }
+
+    // Set input
+    ggml_backend_tensor_set(inp, hidden, 0, sizeof(float) * (size_t)n_tokens * w.n_embd);
+
+    // Compute
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "gemma4_project_hidden: graph_compute failed\n");
+        ggml_free(ctx);
+        return false;
+    }
+
+    // Read result
+    out_tokens.resize(n_tokens);
+    ggml_backend_tensor_get(cur, out_tokens.data(), 0, sizeof(int32_t) * n_tokens);
+
+    ggml_free(ctx);
+    return true;
+}
+
 }  // namespace dflash::common

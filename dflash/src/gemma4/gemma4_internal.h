@@ -198,4 +198,25 @@ bool gemma4_step(
     int                     kv_start,
     std::vector<float> &    out_logits);
 
+// Verify batch: run forward pass returning argmax for ALL positions.
+// Used by DFlash speculative decode target.
+bool gemma4_verify_batch(
+    ggml_backend_t          backend,
+    const Gemma4Weights &   w,
+    Gemma4Cache &           cache,
+    const float *           embed,
+    const int32_t *         token_ids,
+    int                     n_tokens,
+    int                     kv_start,
+    std::vector<int32_t> &  out_argmax);
+
+// Project hidden states through lm_head (out_norm + output + softcap + argmax).
+// Used by DFlash draft to convert draft hidden states to token IDs.
+bool gemma4_project_hidden(
+    ggml_backend_t          backend,
+    const Gemma4Weights &   w,
+    const float *           hidden,
+    int                     n_tokens,
+    std::vector<int32_t> &  out_tokens);
+
 }  // namespace dflash::common
