@@ -12,10 +12,12 @@
 //                              [--max-tokens 4096] [--target-device auto:0]
 
 #include "http_server.h"
+#include "chat_template.h"
 #include "common/backend_factory.h"
 #include "common/gguf_inspect.h"
 #include "common/peer_access.h"
 
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -331,6 +333,7 @@ int main(int argc, char ** argv) {
     // Create backend.
     g_peer_access_opt_in = bargs.device.peer_access;
     std::fprintf(stderr, "[server] creating backend...\n");
+    const std::string arch = detect_arch(bargs.model_path);
     auto backend = create_backend(bargs);
     if (!backend) {
         std::fprintf(stderr, "[server] backend creation failed\n");
@@ -395,6 +398,7 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] ╰─────────────────────────────────────────────────────╯\n\n");
 
     HttpServer server(*backend, tokenizer, sconfig);
+    server.set_chat_format(chat_format_for_arch(arch));
     g_server = &server;
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGINT, signal_handler);

@@ -79,7 +79,8 @@ struct Gemma4Weights {
     // Global tensors
     ggml_tensor * tok_embd               = nullptr;  // [n_embd, n_vocab]
     ggml_tensor * out_norm               = nullptr;  // [n_embd]
-    ggml_tensor * output                 = nullptr;  // [n_embd, n_vocab] (lm_head)
+    ggml_tensor * output                 = nullptr;  // [n_embd, n_vocab] (lm_head, may be tied to tok_embd)
+    ggml_tensor * rope_freqs_global      = nullptr;  // [head_dim/2] global rope freq factors
     ggml_tensor * per_layer_tok_embd     = nullptr;  // [n_embd_per_layer * n_layer, n_vocab]
     ggml_tensor * per_layer_model_proj   = nullptr;  // [n_embd, n_embd_per_layer * n_layer]
     ggml_tensor * per_layer_proj_norm    = nullptr;  // [n_embd_per_layer * n_layer]
@@ -91,8 +92,9 @@ struct Gemma4Weights {
     // Architecture metadata
     int n_layer               = 0;
     int n_head                = 0;
-    int n_head_kv             = 0;
-    int head_dim              = 128;
+    int n_head_kv             = 0;       // max n_head_kv (for backward compat)
+    int head_dim              = 128;     // head_dim for SWA layers (smaller)
+    int head_dim_full         = 128;     // head_dim for full-attention layers
     int n_embd                = 0;
     int n_ff                  = 0;       // dense FFN intermediate
     int n_ff_exp              = 0;       // expert FFN intermediate
@@ -102,6 +104,9 @@ struct Gemma4Weights {
     int n_layer_dense_lead    = 1;
     int n_embd_per_layer      = 0;       // per-layer embedding dim
     int n_vocab               = 0;
+
+    // Per-layer head counts (Gemma4 can have variable n_head_kv per layer)
+    std::vector<int> n_head_kv_per_layer;
 
     // iSWA
     int  sliding_window       = 0;
@@ -132,6 +137,15 @@ inline bool gemma4_has_kv(const Gemma4Weights & w, int il) {
     return il < (int)w.has_kv.size() && w.has_kv[il];
 }
 
+inline int gemma4_head_dim(const Gemma4Weights & w, int il) {
+    return gemma4_is_swa_layer(w, il) ? w.head_dim : w.head_dim_full;
+}
+
+inline int gemma4_n_head_kv(const Gemma4Weights & w, int il) {
+    if (il < (int)w.n_head_kv_per_layer.size()) return w.n_head_kv_per_layer[il];
+    return w.n_head_kv;
+}
+
 // GGUF loader
 bool load_gemma4_gguf(const std::string & path,
                        ggml_backend_t backend,
@@ -144,6 +158,9 @@ struct Gemma4Cache {
     int cur_pos  = 0;
     int max_ctx  = 0;
     int n_layer  = 0;
+    int swa_size = 0;   // ring-buffer size for SWA layers (= sliding_window)
+    int fa_window = 0;  // sparse decode window for full-attn layers (0 = full)
+    int32_t last_tok = -1;  // argmax of last prefill token (for spec-decode entry)
 
     // Only layers where has_kv[il] == true have real K/V tensors.
     // KV-reuse layers reference an earlier layer's cache.
@@ -151,19 +168,36 @@ struct Gemma4Cache {
     std::vector<ggml_tensor *> v;
     std::vector<int>           kv_source;  // for each layer, which layer's KV to use
 
+    // DFlash feature capture ring buffer (BF16, allocated when draft is active)
+    ggml_tensor *         target_feat = nullptr;  // [fc_in, target_feat_cap]
+    int                   target_feat_cap = 0;
+    int                   n_capture_layers = 0;
+    std::vector<int>      capture_layer_ids;
+
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+
+    // Separate context/buffer for target_feat (allocated after draft load)
+    ggml_context *        feat_ctx = nullptr;
+    ggml_backend_buffer_t feat_buf = nullptr;
 };
 
 bool  create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
                            int max_ctx, Gemma4Cache & out);
 void  free_gemma4_cache(Gemma4Cache & c);
 
+// Allocate target_feat ring buffer (call after draft load determines n_capture_layers).
+bool  create_gemma4_target_feat(ggml_backend_t backend, Gemma4Cache & cache,
+                                 int n_capture_layers, int hidden_size, int cap);
+
 // Snapshot
 struct Gemma4Snapshot {
     int cur_pos = 0;
+    int32_t last_tok = -1;
     std::vector<ggml_tensor *> k_snap;
     std::vector<ggml_tensor *> v_snap;
+    ggml_tensor *             feat_snap = nullptr;  // [fc_in, feat_len]
+    int                       feat_cap  = 0;
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
 };
@@ -172,13 +206,50 @@ void free_gemma4_snapshot(Gemma4Snapshot & s);
 
 // Forward: run a single step (prefill chunk or decode token).
 // Returns logits for last token.
+// token_ids: raw token IDs needed for per-layer embedding lookup (may be nullptr
+//            if the model has no per-layer embeddings).
 bool gemma4_step(
     ggml_backend_t          backend,
     const Gemma4Weights &   w,
     Gemma4Cache &           cache,
     const float *           embed,
+    const int32_t *         token_ids,
     int                     n_tokens,
     int                     kv_start,
+    std::vector<float> &    out_logits);
+
+// Verify batch: run forward pass returning argmax for ALL positions.
+// Used by DFlash speculative decode target.
+bool gemma4_verify_batch(
+    ggml_backend_t          backend,
+    const Gemma4Weights &   w,
+    Gemma4Cache &           cache,
+    const float *           embed,
+    const int32_t *         token_ids,
+    int                     n_tokens,
+    int                     kv_start,
+    std::vector<int32_t> &  out_argmax);
+
+// Project hidden states through lm_head (out_norm + output + softcap + argmax).
+// Used by DFlash draft to convert draft hidden states to token IDs.
+bool gemma4_project_hidden(
+    ggml_backend_t          backend,
+    const Gemma4Weights &   w,
+    const float *           hidden,
+    int                     n_tokens,
+    std::vector<int32_t> &  out_tokens);
+
+// BSA sparse-FA prefill: process the full prompt at once using block-sparse
+// attention for SWA layers (flash_prefill_forward_bf16). Full-attention layers
+// use dense FA. Returns logits for the last token.  Populates the KV cache
+// for subsequent decode. Returns false on failure.
+bool gemma4_prefill_bsa(
+    ggml_backend_t          backend,
+    const Gemma4Weights &   w,
+    Gemma4Cache &           cache,
+    const float *           embed,       // [n_embd, S] scaled
+    const int32_t *         token_ids,   // [S] (for per-layer embedding)
+    int                     S,           // total prompt length
     std::vector<float> &    out_logits);
 
 }  // namespace dflash::common

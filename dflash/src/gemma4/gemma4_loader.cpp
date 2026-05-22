@@ -14,10 +14,13 @@
 #include "internal.h"
 #include "dflash27b.h"
 
+#include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #if !defined(_WIN32)
 #include <cerrno>
@@ -54,12 +57,32 @@ struct Gemma4Mmap {
 
 uint32_t get_u32_or(gguf_context * g, const char * key, uint32_t def) {
     int64_t id = gguf_find_key(g, key);
-    return (id >= 0) ? gguf_get_val_u32(g, id) : def;
+    if (id < 0) return def;
+    // Handle array type: return first element
+    if (gguf_get_kv_type(g, id) == GGUF_TYPE_ARRAY) {
+        if (gguf_get_arr_n(g, id) == 0) return def;
+        return ((const uint32_t *)gguf_get_arr_data(g, id))[0];
+    }
+    return gguf_get_val_u32(g, id);
 }
 
 float get_f32_or(gguf_context * g, const char * key, float def) {
     int64_t id = gguf_find_key(g, key);
-    return (id >= 0) ? gguf_get_val_f32(g, id) : def;
+    if (id < 0) return def;
+    if (gguf_get_kv_type(g, id) == GGUF_TYPE_ARRAY) {
+        if (gguf_get_arr_n(g, id) == 0) return def;
+        return ((const float *)gguf_get_arr_data(g, id))[0];
+    }
+    return gguf_get_val_f32(g, id);
+}
+
+// Read a u32 array key into a vector (empty if not found or not an array).
+std::vector<uint32_t> get_u32_arr(gguf_context * g, const char * key) {
+    int64_t id = gguf_find_key(g, key);
+    if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY) return {};
+    const size_t n = gguf_get_arr_n(g, id);
+    const uint32_t * data = (const uint32_t *)gguf_get_arr_data(g, id);
+    return std::vector<uint32_t>(data, data + n);
 }
 
 ggml_tensor * find_tensor(ggml_context * ctx, const char * name) {
@@ -96,14 +119,24 @@ bool load_gemma4_gguf(const std::string & path,
     const uint32_t n_ff_exp      = get_u32_or(gctx, "gemma4.expert_feed_forward_length", 0);
     const uint32_t n_head        = get_u32_or(gctx, "gemma4.attention.head_count", 0);
     const uint32_t n_head_kv     = get_u32_or(gctx, "gemma4.attention.head_count_kv", 0);
-    const uint32_t head_dim      = get_u32_or(gctx, "gemma4.attention.key_length", 128);
-    const uint32_t n_vocab       = get_u32_or(gctx, "gemma4.vocab_size", 0);
+    const uint32_t head_dim_full = get_u32_or(gctx, "gemma4.attention.key_length", 128);
+    const uint32_t head_dim_swa  = get_u32_or(gctx, "gemma4.attention.key_length_swa", head_dim_full);
     const uint32_t n_expert      = get_u32_or(gctx, "gemma4.expert_count", 0);
     const uint32_t n_expert_used = get_u32_or(gctx, "gemma4.expert_used_count", 0);
-    const uint32_t n_dense_lead  = get_u32_or(gctx, "gemma4.leading_dense_block_count", 1);
+    const uint32_t n_dense_lead  = get_u32_or(gctx, "gemma4.leading_dense_block_count", 0);
     const uint32_t sliding_win   = get_u32_or(gctx, "gemma4.attention.sliding_window", 0);
     const uint32_t shared_kv     = get_u32_or(gctx, "gemma4.attention.shared_kv_layers", 0);
     const uint32_t n_embd_pl     = get_u32_or(gctx, "gemma4.embedding_length_per_layer_input", 0);
+
+    // Per-layer head_count_kv (may be array or scalar)
+    std::vector<uint32_t> head_kv_arr = get_u32_arr(gctx, "gemma4.attention.head_count_kv");
+
+    // Get vocab size from token_embd tensor shape (not always in metadata)
+    uint32_t n_vocab = get_u32_or(gctx, "gemma4.vocab_size", 0);
+    if (n_vocab == 0) {
+        ggml_tensor * tok_embd = find_tensor(meta_ctx, "token_embd.weight");
+        if (tok_embd) n_vocab = (uint32_t)tok_embd->ne[1];
+    }
 
     const float rope_base_full   = get_f32_or(gctx, "gemma4.rope.freq_base", 1000000.0f);
     const float rope_base_swa    = get_f32_or(gctx, "gemma4.rope.freq_base_swa", 10000.0f);
@@ -121,7 +154,8 @@ bool load_gemma4_gguf(const std::string & path,
     out.n_layer            = (int)n_layer;
     out.n_head             = (int)n_head;
     out.n_head_kv          = (int)n_head_kv;
-    out.head_dim           = (int)head_dim;
+    out.head_dim           = (int)head_dim_swa;   // SWA head_dim (smaller)
+    out.head_dim_full      = (int)head_dim_full;  // full-attn head_dim (larger)
     out.n_embd             = (int)n_embd;
     out.n_ff               = (int)n_ff;
     out.n_ff_exp           = (int)n_ff_exp;
@@ -137,6 +171,18 @@ bool load_gemma4_gguf(const std::string & path,
     out.final_logit_softcap = logit_softcap;
     out.norm_eps            = norm_eps;
 
+    // Per-layer n_head_kv from array (or fill scalar)
+    out.n_head_kv_per_layer.resize(n_layer);
+    if (!head_kv_arr.empty()) {
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            out.n_head_kv_per_layer[il] = (int)(il < head_kv_arr.size() ? head_kv_arr[il] : head_kv_arr.back());
+        }
+    } else {
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            out.n_head_kv_per_layer[il] = (int)n_head_kv;
+        }
+    }
+
     // KV sharing: last shared_kv layers reuse earlier KV
     out.kv_sharing_start = (int)(n_layer - shared_kv);
     out.has_kv.resize(n_layer);
@@ -144,26 +190,38 @@ bool load_gemma4_gguf(const std::string & path,
         out.has_kv[il] = (int)il < out.kv_sharing_start;
     }
 
-    // SWA pattern from GGUF (array of bools or compute from pattern)
+    // SWA pattern from GGUF (array of bools indicating SWA layers)
     out.swa_layers.resize(n_layer, false);
     {
         int64_t pat_id = gguf_find_key(gctx, "gemma4.attention.sliding_window_pattern");
         if (pat_id >= 0 && gguf_get_kv_type(gctx, pat_id) == GGUF_TYPE_ARRAY) {
             const size_t n = gguf_get_arr_n(gctx, pat_id);
-            // Pattern repeats over layers
-            for (uint32_t il = 0; il < n_layer; ++il) {
-                // 0 = full, 1 = SWA in the pattern
-                // Read from array, cycling if needed
-                if (n > 0) {
-                    // For gemma4 the pattern is typically stored as a boolean array
-                    // indicating whether each layer is SWA
-                    out.swa_layers[il] = (il % n != 0);  // first in group = full
+            if (n > 0) {
+                const auto arr_type = gguf_get_arr_type(gctx, pat_id);
+                const void * data = gguf_get_arr_data(gctx, pat_id);
+                for (uint32_t il = 0; il < n_layer; ++il) {
+                    size_t idx = il % n;  // cycle if pattern shorter than n_layer
+                    if (arr_type == GGUF_TYPE_BOOL || arr_type == GGUF_TYPE_UINT8) {
+                        out.swa_layers[il] = ((const uint8_t *)data)[idx] != 0;
+                    } else if (arr_type == GGUF_TYPE_INT32 || arr_type == GGUF_TYPE_UINT32) {
+                        out.swa_layers[il] = ((const uint32_t *)data)[idx] != 0;
+                    }
                 }
             }
         } else {
-            // Default: every 4th layer is full, rest SWA (like laguna)
-            for (uint32_t il = 0; il < n_layer; ++il) {
-                out.swa_layers[il] = (il % 4 != 0);
+            // Fallback: infer from per-layer head_kv (small kv = full, large kv = swa)
+            // or use default pattern (alternating 5:1)
+            if (!head_kv_arr.empty() && head_kv_arr.size() >= n_layer) {
+                uint32_t max_kv = *std::max_element(head_kv_arr.begin(), head_kv_arr.end());
+                for (uint32_t il = 0; il < n_layer; ++il) {
+                    // Layers with max n_head_kv are SWA, smaller are full-attn
+                    out.swa_layers[il] = (head_kv_arr[il] == max_kv);
+                }
+            } else {
+                // Default: every 6th layer is full, rest SWA (5:1 pattern)
+                for (uint32_t il = 0; il < n_layer; ++il) {
+                    out.swa_layers[il] = ((il % 6) != 5);
+                }
             }
         }
     }
@@ -177,8 +235,8 @@ bool load_gemma4_gguf(const std::string & path,
     if (out.eos_id == (int32_t)miss) out.eos_id = 1;
     if (out.eos_chat_id == (int32_t)miss) out.eos_chat_id = -1;
 
-    std::printf("[gemma4-loader] n_layer=%u n_embd=%u head_dim=%u n_head=%u n_head_kv=%u\n",
-                n_layer, n_embd, head_dim, n_head, n_head_kv);
+    std::printf("[gemma4-loader] n_layer=%u n_embd=%u head_dim_swa=%u head_dim_full=%u n_head=%u n_head_kv=%u\n",
+                n_layer, n_embd, head_dim_swa, head_dim_full, n_head, n_head_kv);
     std::printf("[gemma4-loader] n_expert=%u used=%u dense_lead=%u sliding_window=%u\n",
                 n_expert, n_expert_used, n_dense_lead, sliding_win);
     std::printf("[gemma4-loader] kv_sharing_start=%d per_layer_embd=%u logit_softcap=%g\n",
@@ -221,8 +279,8 @@ bool load_gemma4_gguf(const std::string & path,
             tok_embd_off  = offset;
             tok_embd_sz   = sz;
             tok_embd_type = t->type;
-            // Set data pointer for metadata but don't copy to GPU
-            t->data = (void *)src;
+            // Upload to GPU (needed for tied lm_head / output)
+            ggml_backend_tensor_set(t, src, 0, sz);
         } else {
             ggml_backend_tensor_set(t, src, 0, sz);
         }
@@ -244,7 +302,11 @@ bool load_gemma4_gguf(const std::string & path,
     // ── Assign tensors to struct ───────────────────────────────────────
     out.tok_embd = find_tensor(meta_ctx, "token_embd.weight");
     out.out_norm = find_tensor(meta_ctx, "output_norm.weight");
+    // Gemma4 uses tied embeddings: lm_head = token_embd
     out.output   = find_tensor(meta_ctx, "output.weight");
+    if (!out.output) out.output = out.tok_embd;
+    // Global rope_freqs (not per-layer in this model variant)
+    out.rope_freqs_global = find_tensor(meta_ctx, "rope_freqs.weight");
     out.per_layer_tok_embd   = find_tensor(meta_ctx, "per_layer_tok_embd.weight");
     out.per_layer_model_proj = find_tensor(meta_ctx, "per_layer_model_proj.weight");
     out.per_layer_proj_norm  = find_tensor(meta_ctx, "per_layer_proj_norm.weight");
@@ -266,35 +328,35 @@ bool load_gemma4_gguf(const std::string & path,
         L.wo              = get("attn_output.weight");
         L.q_norm          = get("attn_q_norm.weight");
         L.k_norm          = get("attn_k_norm.weight");
-        L.attn_post_norm  = get("attn_post_norm.weight");
+        L.attn_post_norm  = get("post_attention_norm.weight");
         L.rope_freqs      = get("rope_freqs.weight");
 
         L.ffn_norm        = get("ffn_norm.weight");
         L.ffn_gate        = get("ffn_gate.weight");
         L.ffn_up          = get("ffn_up.weight");
         L.ffn_down        = get("ffn_down.weight");
-        L.ffn_post_norm   = get("ffn_post_norm.weight");
+        L.ffn_post_norm   = get("post_ffw_norm.weight");
 
-        // MoE tensors
-        L.ffn_norm_moe     = get("ffn_norm.weight");  // same tensor for both paths
+        // MoE tensors (only present for MoE models)
+        L.ffn_norm_moe     = get("ffn_norm_moe.weight");
         L.ffn_gate_inp     = get("ffn_gate_inp.weight");
-        L.ffn_gate_inp_s   = get("ffn_gate_inp_shexp.weight");
+        L.ffn_gate_inp_s   = get("ffn_gate_inp.scale");
         L.ffn_gate_up_exps = get("ffn_gate_up_exps.weight");
         L.ffn_down_exps    = get("ffn_down_exps.weight");
-        L.ffn_down_exps_s  = get("ffn_down_exps_s.weight");
+        L.ffn_down_exps_s  = get("ffn_down_exps.scale");
         L.ffn_gate_shexp   = get("ffn_gate_shexp.weight");
         L.ffn_up_shexp     = get("ffn_up_shexp.weight");
         L.ffn_down_shexp   = get("ffn_down_shexp.weight");
-        L.ffn_pre_norm_2   = get("ffn_pre_norm_2.weight");
-        L.ffn_post_norm_1  = get("ffn_post_norm_1.weight");
-        L.ffn_post_norm_2  = get("ffn_post_norm_2.weight");
+        L.ffn_pre_norm_2   = get("pre_ffw_norm_2.weight");
+        L.ffn_post_norm_1  = get("post_ffw_norm_1.weight");
+        L.ffn_post_norm_2  = get("post_ffw_norm_2.weight");
 
         // Per-layer embedding
         L.per_layer_inp_gate  = get("per_layer_inp_gate.weight");
         L.per_layer_proj      = get("per_layer_proj.weight");
         L.per_layer_post_norm = get("per_layer_post_norm.weight");
 
-        L.out_scale = get("out_scale.weight");
+        L.out_scale = get("layer_output_scale.weight");
     }
 
     std::printf("[gemma4-loader] loaded %d tensors, vocab=%d\n", n_tensors, (int)n_vocab);
@@ -314,9 +376,6 @@ void free_gemma4_weights(Gemma4Weights & w) {
 
 bool create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
                           int max_ctx, Gemma4Cache & out) {
-    const int D  = w.head_dim;
-    const int Hk = w.n_head_kv;
-
     ggml_init_params ip{};
     ip.mem_size = ggml_tensor_overhead() * (size_t)(w.n_layer * 2 + 4) + 4096;
     ip.no_alloc = true;
@@ -327,12 +386,20 @@ bool create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
     out.v.resize(w.n_layer, nullptr);
     out.kv_source.resize(w.n_layer);
 
+    // SWA layers use a ring buffer of size min(sliding_window, max_ctx).
+    const int swa_size = (w.sliding_window > 0 && w.sliding_window < max_ctx)
+                             ? w.sliding_window : max_ctx;
+
     // Determine KV source for each layer
     int last_kv_layer = -1;
     for (int il = 0; il < w.n_layer; ++il) {
         if (w.has_kv[il]) {
-            out.k[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, Hk, max_ctx);
-            out.v[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, Hk, max_ctx);
+            const int D  = gemma4_head_dim(w, il);
+            const int Hk = gemma4_n_head_kv(w, il);
+            const bool is_swa = gemma4_is_swa_layer(w, il);
+            const int cache_len = is_swa ? swa_size : max_ctx;
+            out.k[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, cache_len, Hk);
+            out.v[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, cache_len, Hk);
             out.kv_source[il] = il;
             last_kv_layer = il;
         } else {
@@ -350,21 +417,71 @@ bool create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
     out.cur_pos = 0;
     out.max_ctx = max_ctx;
     out.n_layer = w.n_layer;
+    out.swa_size = swa_size;
     return true;
 }
 
 void free_gemma4_cache(Gemma4Cache & c) {
+    if (c.feat_buf) { ggml_backend_buffer_free(c.feat_buf); c.feat_buf = nullptr; }
+    if (c.feat_ctx) { ggml_free(c.feat_ctx); c.feat_ctx = nullptr; }
+    c.target_feat = nullptr;
+    c.target_feat_cap = 0;
+    c.n_capture_layers = 0;
+    c.capture_layer_ids.clear();
     if (c.buf) { ggml_backend_buffer_free(c.buf); c.buf = nullptr; }
     if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
     c.k.clear(); c.v.clear(); c.kv_source.clear();
     c.cur_pos = 0;
 }
 
+bool create_gemma4_target_feat(ggml_backend_t backend, Gemma4Cache & cache,
+                                int n_capture_layers, int hidden_size, int cap) {
+    if (n_capture_layers <= 0 || hidden_size <= 0 || cap <= 0) return false;
+
+    // Free existing feat allocation
+    if (cache.feat_buf) { ggml_backend_buffer_free(cache.feat_buf); cache.feat_buf = nullptr; }
+    if (cache.feat_ctx) { ggml_free(cache.feat_ctx); cache.feat_ctx = nullptr; }
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 4 + 4096;
+    ip.no_alloc = true;
+    cache.feat_ctx = ggml_init(ip);
+    if (!cache.feat_ctx) return false;
+
+    const int fc_in = n_capture_layers * hidden_size;
+    cache.target_feat = ggml_new_tensor_2d(cache.feat_ctx, GGML_TYPE_BF16, fc_in, cap);
+    ggml_set_name(cache.target_feat, "gemma4_target_feat");
+
+    cache.feat_buf = ggml_backend_alloc_ctx_tensors(cache.feat_ctx, backend);
+    if (!cache.feat_buf) {
+        ggml_free(cache.feat_ctx); cache.feat_ctx = nullptr;
+        cache.target_feat = nullptr;
+        return false;
+    }
+
+    cache.target_feat_cap = cap;
+    cache.n_capture_layers = n_capture_layers;
+
+    // Compute capture layer IDs using floating-point linspace with rounding.
+    // This matches the training config (e.g., gemma4: [1,12,23,35,46,57]).
+    cache.capture_layer_ids.resize(n_capture_layers);
+    const int n_layer = cache.n_layer;
+    for (int k = 0; k < n_capture_layers; k++) {
+        cache.capture_layer_ids[k] = (int)std::round(
+            1.0 + k * (double)(n_layer - 4) / (n_capture_layers - 1));
+    }
+
+    return true;
+}
+
 void free_gemma4_snapshot(Gemma4Snapshot & s) {
     if (s.buf) { ggml_backend_buffer_free(s.buf); s.buf = nullptr; }
     if (s.ctx) { ggml_free(s.ctx); s.ctx = nullptr; }
     s.k_snap.clear(); s.v_snap.clear();
-    s.cur_pos = 0;
+    s.feat_snap = nullptr;
+    s.feat_cap  = 0;
+    s.cur_pos   = 0;
+    s.last_tok  = -1;
 }
 
 }  // namespace dflash::common

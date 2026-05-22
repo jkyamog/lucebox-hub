@@ -24,13 +24,12 @@ extern "C" {
 // Qwen3.5-27B qwen35 hybrid uses 24 Q heads, 4 KV heads, 256 head_dim, which
 // live in `src/internal.h` (n_embd_head_k/v, N_HEAD, N_HEAD_KV). Naming is
 // historical — do not change without updating draft_safetensors_loader.cpp +
-// draft_dflash_graph.cpp which consume these as draft-side constants.
+// draft_graph.cpp which consume these as draft-side constants.
 #define DFLASH27B_TARGET_N_HEADS       32
 #define DFLASH27B_TARGET_N_KV_HEADS    8
 #define DFLASH27B_TARGET_HEAD_DIM      128
 #define DFLASH27B_TARGET_INTERMEDIATE  17408
 #define DFLASH27B_TARGET_VOCAB         248320
-#define DFLASH27B_ROPE_THETA           10000000.0f
 #define DFLASH27B_RMS_EPS              1e-6f
 
 #define DFLASH27B_DRAFT_LAYERS         5

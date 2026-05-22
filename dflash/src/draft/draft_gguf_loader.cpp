@@ -2,7 +2,7 @@
 // on the CUDA backend.
 //
 // This is the Q8_0-quantized counterpart of draft_safetensors_loader.cpp. The
-// draft graph builder (draft_dflash_graph.cpp) doesn't care about tensor storage
+// draft graph builder (draft_graph.cpp) doesn't care about tensor storage
 // types — ggml's ggml_mul_mat handles Q8_0 × F32 dequantization transparently.
 //
 // GGUF arch: "qwen35-dflash-draft" (from convert_dflash_to_gguf.py /
@@ -159,6 +159,12 @@ bool load_draft_gguf(const std::string & path,
         std::snprintf(key, sizeof(key), "%s.%s", A, suffix);
         return get_u32_or(gctx, key, fallback);
     };
+    auto read_f32 = [&](const char * suffix, float fallback) -> float {
+        std::snprintf(key, sizeof(key), "%s.%s", A, suffix);
+        int64_t id = gguf_find_key(gctx, key);
+        if (id < 0) return fallback;
+        return gguf_get_val_f32(gctx, id);
+    };
 
     const uint32_t n_embd    = read_u32("embedding_length",        0);
     const uint32_t n_layer   = read_u32("block_count",             0);
@@ -235,6 +241,10 @@ bool load_draft_gguf(const std::string & path,
     out.head_dim  = (int)head_dim;
     out.n_embd    = (int)n_embd;
     out.n_ff      = (int)n_ff;
+    out.rope_theta = read_f32("rope.freq_base", 0.0f);
+    if (out.rope_theta == 0.0f) {
+        fprintf(stderr, "[draft-gguf] WARNING: rope.freq_base not found in GGUF, draft RoPE will be wrong\n");
+    }
     out.layers.assign((size_t)n_layer, DraftLayer{});
 
     auto g = [&](const char * name) -> ggml_tensor * {
