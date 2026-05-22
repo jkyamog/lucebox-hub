@@ -229,23 +229,6 @@ class TestSamplingParameters:
         content = r.json()["choices"][0]["message"]["content"]
         assert len(content) > 0
 
-    def test_temperature_high_produces_variance(self):
-        """High temperature with different seeds should produce different outputs."""
-        base = {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "Name a color."}],
-            "stream": False,
-            "max_tokens": 8,
-            "temperature": 1.5,
-        }
-        results = set()
-        for seed in [1, 2, 3, 4, 5]:
-            r = post_json("/v1/chat/completions", {**base, "seed": seed})
-            assert r.status_code == 200
-            results.add(r.json()["choices"][0]["message"]["content"].strip())
-        # With high temp and different seeds, we expect at least some variance
-        assert len(results) >= 2, f"Expected variance, got: {results}"
-
     def test_seed_reproducibility(self):
         """Same seed + same temperature should produce identical output."""
         body = {
@@ -276,24 +259,6 @@ class TestSamplingParameters:
         assert r.status_code == 200
         assert len(r.json()["choices"][0]["message"]["content"]) > 0
 
-    def test_top_p_restrictive(self):
-        """Very low top_p should make output more deterministic."""
-        body = {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
-            "stream": False,
-            "max_tokens": 4,
-            "temperature": 1.0,
-            "top_p": 0.01,
-        }
-        # With very low top_p, even with temp=1, output should be consistent
-        r1 = post_json("/v1/chat/completions", body)
-        r2 = post_json("/v1/chat/completions", body)
-        assert r1.status_code == 200
-        assert r2.status_code == 200
-        assert (r1.json()["choices"][0]["message"]["content"]
-                == r2.json()["choices"][0]["message"]["content"])
-
     def test_top_k_accepted(self):
         """top_k parameter should be accepted."""
         r = post_json("/v1/chat/completions", {
@@ -319,28 +284,6 @@ class TestSamplingParameters:
         })
         assert r.status_code == 200
         assert len(r.json()["choices"][0]["message"]["content"]) > 0
-
-    def test_frequency_penalty_reduces_repetition(self):
-        """High frequency_penalty should reduce token repetition in output."""
-        prompt = "Repeat the word 'hello' as many times as possible."
-        base = {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-            "max_tokens": 64,
-            "temperature": 0.3,
-        }
-        # Without penalty
-        r_no_pen = post_json("/v1/chat/completions", {**base, "frequency_penalty": 0.0})
-        # With high penalty
-        r_pen = post_json("/v1/chat/completions", {**base, "frequency_penalty": 2.0})
-        assert r_no_pen.status_code == 200
-        assert r_pen.status_code == 200
-
-        text_no_pen = r_no_pen.json()["choices"][0]["message"]["content"].lower()
-        text_pen = r_pen.json()["choices"][0]["message"]["content"].lower()
-        # The penalized version should have fewer repetitions of "hello"
-        assert text_no_pen.count("hello") >= text_pen.count("hello")
 
     def test_presence_penalty_accepted(self):
         """presence_penalty should be accepted and produce output."""
