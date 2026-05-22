@@ -123,7 +123,7 @@ bool load_gemma4_gguf(const std::string & path,
     const uint32_t head_dim_swa  = get_u32_or(gctx, "gemma4.attention.key_length_swa", head_dim_full);
     const uint32_t n_expert      = get_u32_or(gctx, "gemma4.expert_count", 0);
     const uint32_t n_expert_used = get_u32_or(gctx, "gemma4.expert_used_count", 0);
-    const uint32_t n_dense_lead  = get_u32_or(gctx, "gemma4.leading_dense_block_count", 1);
+    const uint32_t n_dense_lead  = get_u32_or(gctx, "gemma4.leading_dense_block_count", 0);
     const uint32_t sliding_win   = get_u32_or(gctx, "gemma4.attention.sliding_window", 0);
     const uint32_t shared_kv     = get_u32_or(gctx, "gemma4.attention.shared_kv_layers", 0);
     const uint32_t n_embd_pl     = get_u32_or(gctx, "gemma4.embedding_length_per_layer_input", 0);
@@ -340,16 +340,16 @@ bool load_gemma4_gguf(const std::string & path,
         // MoE tensors (only present for MoE models)
         L.ffn_norm_moe     = get("ffn_norm_moe.weight");
         L.ffn_gate_inp     = get("ffn_gate_inp.weight");
-        L.ffn_gate_inp_s   = get("ffn_gate_inp_shexp.weight");
+        L.ffn_gate_inp_s   = get("ffn_gate_inp.scale");
         L.ffn_gate_up_exps = get("ffn_gate_up_exps.weight");
         L.ffn_down_exps    = get("ffn_down_exps.weight");
-        L.ffn_down_exps_s  = get("ffn_down_exps_s.weight");
+        L.ffn_down_exps_s  = get("ffn_down_exps.scale");
         L.ffn_gate_shexp   = get("ffn_gate_shexp.weight");
         L.ffn_up_shexp     = get("ffn_up_shexp.weight");
         L.ffn_down_shexp   = get("ffn_down_shexp.weight");
-        L.ffn_pre_norm_2   = get("ffn_pre_norm_2.weight");
-        L.ffn_post_norm_1  = get("ffn_post_norm_1.weight");
-        L.ffn_post_norm_2  = get("ffn_post_norm_2.weight");
+        L.ffn_pre_norm_2   = get("pre_ffw_norm_2.weight");
+        L.ffn_post_norm_1  = get("post_ffw_norm_1.weight");
+        L.ffn_post_norm_2  = get("post_ffw_norm_2.weight");
 
         // Per-layer embedding
         L.per_layer_inp_gate  = get("per_layer_inp_gate.weight");

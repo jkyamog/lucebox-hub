@@ -113,6 +113,8 @@ static ggml_tensor * build_gemma4_moe_block(ggml_context * ctx, ggml_tensor * at
         n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
         gate_up_e->nb[1], gate_up_e->nb[2],
         (size_t)n_ff_exp * ggml_element_size(gate_up_e));
+    gate_e = ggml_cont(ctx, gate_e);
+    up_e = ggml_cont(ctx, up_e);
     ggml_tensor * gu = ggml_mul(ctx, ggml_gelu(ctx, gate_e), up_e);
     ggml_tensor * experts = ggml_mul_mat_id(ctx, L.ffn_down_exps, gu, selected);
 
