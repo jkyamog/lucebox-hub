@@ -302,6 +302,30 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             req.tools = body["tools"];
         }
 
+        // Stop sequences — OpenAI uses "stop" (string or array), Anthropic uses "stop_sequences" (array).
+        if (body.contains("stop")) {
+            auto & stop = body["stop"];
+            if (stop.is_string()) {
+                std::string s = stop.get<std::string>();
+                if (!s.empty()) req.stop_sequences.push_back(s);
+            } else if (stop.is_array()) {
+                for (const auto & item : stop) {
+                    if (item.is_string()) {
+                        std::string s = item.get<std::string>();
+                        if (!s.empty()) req.stop_sequences.push_back(s);
+                    }
+                }
+            }
+        }
+        if (body.contains("stop_sequences") && body["stop_sequences"].is_array()) {
+            for (const auto & item : body["stop_sequences"]) {
+                if (item.is_string()) {
+                    std::string s = item.get<std::string>();
+                    if (!s.empty()) req.stop_sequences.push_back(s);
+                }
+            }
+        }
+
         if (hr.path == "/v1/chat/completions") {
             req.format = ApiFormat::OPENAI_CHAT;
             req.response_id = generate_id("chatcmpl");
@@ -510,7 +534,8 @@ void HttpServer::worker_loop() {
         // Create SSE emitter for streaming state machine.
         SseEmitter emitter(req.format, req.response_id, req.model,
                            (int)req.prompt_tokens.size(), req.tools,
-                           &tool_memory_, req.started_in_thinking);
+                           &tool_memory_, req.started_in_thinking,
+                           req.stop_sequences);
 
         // Emit initial SSE events.
         if (req.stream) {
@@ -707,6 +732,8 @@ void HttpServer::worker_loop() {
                         return false;
                     }
                 }
+                // Stop generation if a stop sequence was hit.
+                if (emitter.stop_hit()) return false;
             }
             return true;
         };
@@ -800,6 +827,7 @@ void HttpServer::worker_loop() {
                 if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') continue;
                 std::string text = tokenizer_.token_text(tok);
                 emitter.emit_token(text);
+                if (emitter.stop_hit()) break;
             }
             emitter.emit_finish((int)result.tokens.size());
 
